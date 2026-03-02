@@ -1,0 +1,80 @@
+import numpy as np
+import pandas as pd
+
+# ─────────────────────────────────────────────────────────────────────
+# true_file, u_grid, tds, pred_test, and n_plot must already be defined
+# ─────────────────────────────────────────────────────────────────────
+
+df_true = pd.read_csv(true_file, header=None)
+
+# storage for averaging later
+mae_list       = []
+rmse_list      = []
+maxerr_list    = []
+area_list      = []
+maepct_list    = []
+
+for i in range(n_plot):
+    # load true curves
+    depth_true = pd.to_numeric(df_true.iloc[:,2*i],   errors='coerce').to_numpy()
+    load_true  = pd.to_numeric(df_true.iloc[:,2*i+1], errors='coerce').to_numpy()
+
+    # predicted grid & load
+    depth_pred = u_grid * tds[i]
+    load_pred  = pred_test[i]
+
+    # interpolate true onto pred-depths
+    true_interp = np.interp(depth_pred, depth_true, load_true,
+                            left=np.nan, right=np.nan)
+
+    # only keep valid points where true_interp isn’t nan
+    mask = ~np.isnan(true_interp)
+    if not mask.any():
+        print(f"Sample {i+1}: no overlap, skipping")
+        continue
+
+    y_true = true_interp[mask]
+    y_pred = load_pred[mask]
+    d      = depth_pred[mask]
+
+    # pointwise error
+    diff     = y_true - y_pred
+    abs_diff = np.abs(diff)
+
+    # 1. MAE
+    mae = abs_diff.mean()
+    # 2. RMSE
+    rmse = np.sqrt((diff**2).mean())
+    # 3. L∞ (max abs error)
+    maxerr = abs_diff.max()
+    # 4. Area between curves (L1 integral)
+    area = np.trapz(abs_diff, d)
+    # 5. MAE as % of mean actual
+    mean_true = y_true.mean()
+    maepct    = mae / mean_true * 100 if mean_true != 0 else np.nan
+
+    # store
+    mae_list.append(mae)
+    rmse_list.append(rmse)
+    maxerr_list.append(maxerr)
+    area_list.append(area)
+    maepct_list.append(maepct)
+
+    # report for this sample
+    print(f"Sample {i+1}:")
+    print(f"  MAE       = {mae:.4f}")
+    print(f"  RMSE      = {rmse:.4f}")
+    print(f"  L∞ max err= {maxerr:.4f}")
+    print(f"  Area(L₁)  = {area:.4f} (load·depth)")
+    print(f"  MAE %mean = {maepct:.2f}%\n")
+
+# overall averages
+if mae_list:
+    print("Overall averages:")
+    print(f"  MAE       = {np.mean(mae_list):.4f}")
+    print(f"  RMSE      = {np.mean(rmse_list):.4f}")
+    print(f"  L∞        = {np.mean(maxerr_list):.4f}")
+    print(f"  Area(L₁)  = {np.mean(area_list):.4f}")
+    print(f"  MAE %mean = {np.mean(maepct_list):.2f}%")
+else:
+    print("No valid samples to compute metrics.")
