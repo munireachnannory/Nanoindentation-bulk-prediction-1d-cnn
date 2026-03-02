@@ -1,0 +1,61 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ─────────────────────────────────────────────────────────────────────
+# Assume mae_list, rmse_list, maxerr_list, area_list, maepct_list exist
+# ─────────────────────────────────────────────────────────────────────
+
+# Convert to arrays
+mae_arr    = np.array(mae_list)
+rmse_arr   = np.array(rmse_list)
+maxerr_arr = np.array(maxerr_list)
+area_arr   = np.array(area_list)
+maepct_arr = np.array(maepct_list)
+
+# Compute overall averages
+avg_mae     = mae_arr.mean()
+avg_rmse    = rmse_arr.mean()
+avg_maxerr  = maxerr_arr.mean()
+avg_area    = area_arr.mean()
+avg_maepct  = maepct_arr.mean()
+
+# Print overall averages
+print("=== Overall Average Metrics ===")
+print(f"Average MAE (L₁ mean):               {avg_mae:.4f}")
+print(f"Average RMSE (L₂ norm):              {avg_rmse:.4f}")
+print(f"Average L∞ (max abs error):          {avg_maxerr:.4f}")
+print(f"Average Area between curves (L₁):    {avg_area:.4f} (load·depth)")
+print(f"Average MAE as % of mean actual:     {avg_maepct:.2f}%")
+
+# ─────────────────────────────────────────────────────────────────────
+# Plot per‐sample metrics and bar chart of averages
+# ─────────────────────────────────────────────────────────────────────
+samples = np.arange(1, len(mae_arr) + 1)
+
+plt.figure(figsize=(10,8))
+
+# Top: per-sample trends
+plt.subplot(2,1,1)
+plt.plot(samples, mae_arr,    '-o', label='MAE')
+plt.plot(samples, rmse_arr,   '-o', label='RMSE')
+plt.plot(samples, maxerr_arr, '-o', label='L∞')
+plt.plot(samples, maepct_arr, '-o', label='MAE %')
+plt.xlabel('Sample #')
+plt.ylabel('Metric value')
+plt.title('Error Metrics per Sample')
+plt.legend()
+plt.grid(True)
+
+# Bottom: bar chart of the five average values
+plt.subplot(2,1,2)
+metrics = ['MAE','RMSE','L∞','Area','MAE%']
+avg_vals = [avg_mae, avg_rmse, avg_maxerr, avg_area, avg_maepct]
+bars = plt.bar(metrics, avg_vals)
+for bar, val in zip(bars, avg_vals):
+    plt.text(bar.get_x() + bar.get_width()/2, val, f"{val:.2f}",
+             ha='center', va='bottom')
+
+plt.ylabel('Average value')
+plt.title('Average Error Metrics Across All Samples')
+plt.tight_layout()
+plt.show()
