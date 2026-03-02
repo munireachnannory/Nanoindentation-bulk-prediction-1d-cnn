@@ -1,0 +1,756 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.patches import Patch
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score
+import warnings
+warnings.filterwarnings('ignore')
+
+# ─────────────────────────────────────────────────────────────────────
+# (1) File paths — adjust to your environment
+# ─────────────────────────────────────────────────────────────────────
+bulk_file       = '/content/drive/MyDrive/2024 UTk Research/2024 Fall Thin Film/Substrate Correction 2025/Test 5 Train with 6th and Soft pro Depth 200nm/Bulk 6th & Soft Pro Depth 2.xlsx'
+thin_file       = '/content/drive/MyDrive/2024 UTk Research/2024 Fall Thin Film/Substrate Correction 2025/Different Thickness Film/1 um Thickness/Thin 1 um thick 1-1700 6th & soft Pro.xlsx'
+props_file      = '/content/drive/MyDrive/2024 UTk Research/2024 Fall Thin Film/Substrate Correction 2025/Test 5 Train with 6th and Soft pro Depth 200nm/Properties 6th and Soft Pro 1700 Data sets.xlsx'
+test_thin_file  = '/content/drive/MyDrive/2024 UTk Research/2024 Fall Thin Film/Substrate Correction 2025/Different Thickness Film/1 um Thickness/Thin 1um Thick pro 5th 1-500.xlsx'
+pred_output     = '/content/drive/MyDrive/2024 UTk Research/2024 Fall Thin Film/Substrate Correction 2025/Different Thickness Film/1 um Thickness/predicted_bulk_curves1.xlsx'
+true_file       = '/content/drive/MyDrive/2024 UTk Research/2024 Fall Thin Film/5th Hard + soft Properties Mix/Bulk 5th Properties 1-500.csv'
+
+# ─────────────────────────────────────────────────────────────────────
+# (2) Load & preprocess training data
+# ─────────────────────────────────────────────────────────────────────
+df_bulk = pd.read_excel(bulk_file, header=None)
+df_thin = pd.read_excel(thin_file, header=None)
+
+df_props = pd.read_excel(props_file, sheet_name=0)
+df_props.columns = df_props.columns.str.strip().str.lower()
+cols = ['e','sigma_y','sigma_s']
+if set(cols).issubset(df_props.columns):
+    props = df_props[cols].to_numpy(dtype=np.float32)
+else:
+    props = df_props.iloc[:, :3].to_numpy(dtype=np.float32)
+p_mean, p_std = props.mean(0), props.std(0)
+p_std[p_std == 0] = 1.0
+props_norm = ((props - p_mean) / p_std).astype(np.float32)
+
+n_samples = df_bulk.shape[1] // 2
+n_points  = 200
+u_grid    = np.linspace(0, 1, n_points, dtype=np.float32)
+
+thin_in    = np.zeros((n_samples, n_points), dtype=np.float32)
+bulk_tar   = np.zeros((n_samples, n_points), dtype=np.float32)
+max_depths = np.zeros(n_samples, dtype=np.float32)
+
+for i in range(n_samples):
+    db = pd.to_numeric(df_bulk.iloc[:, 2*i],   errors='coerce').to_numpy()
+    lb = pd.to_numeric(df_bulk.iloc[:, 2*i+1], errors='coerce').to_numpy()
+    dt = pd.to_numeric(df_thin.iloc[:, 2*i],   errors='coerce').to_numpy()
+    lt = pd.to_numeric(df_thin.iloc[:, 2*i+1], errors='coerce').to_numpy()
+
+    md_thin = np.nanmax(dt) if not np.all(np.isnan(dt)) else 1.0
+    md_bulk = np.nanmax(db) if not np.all(np.isnan(db)) else 1.0
+    max_depths[i] = md_thin
+
+    norm_dt   = dt   / (md_thin if md_thin != 0 else 1.0)
+    norm_db   = db   / (md_bulk if md_bulk != 0 else 1.0)
+
+    mask_t = (~np.isnan(norm_dt)) & (~np.isnan(lt))
+    if mask_t.sum() >= 2:
+        Xt = np.vstack([norm_dt[mask_t]**2, norm_dt[mask_t]]).T
+        yt = lt[mask_t]
+        coeffs_t, *_ = np.linalg.lstsq(Xt, yt, rcond=None)
+        a_t, b_t = coeffs_t
+        thin_in[i] = (a_t * u_grid**2 + b_t * u_grid).astype(np.float32)
+    else:
+        thin_in[i] = np.interp(u_grid, norm_dt, lt).astype(np.float32)
+
+    mask_b = (~np.isnan(norm_db)) & (~np.isnan(lb))
+    if mask_b.sum() >= 2:
+        Xb = np.vstack([norm_db[mask_b]**2, norm_db[mask_b]]).T
+        yb = lb[mask_b]
+        coeffs_b, *_ = np.linalg.lstsq(Xb, yb, rcond=None)
+        a_b, b_b = coeffs_b
+        bulk_tar[i] = (a_b * u_grid**2 + b_b * u_grid).astype(np.float32)
+    else:
+        bulk_tar[i] = np.interp(u_grid, norm_db, lb).astype(np.float32)
+
+global_max    = max_depths.max()
+depth_channel = (u_grid * global_max).astype(np.float32)
+depth_mat     = np.tile(depth_channel, (n_samples, 1)).astype(np.float32)
+
+mask = np.isnan(thin_in).any(1) | np.isnan(bulk_tar).any(1) | np.isnan(props_norm).any(1)
+thin_in, bulk_tar, props_norm, depth_mat, max_depths = [
+    arr[~mask] for arr in (thin_in, bulk_tar, props_norm, depth_mat, max_depths)
+]
+
+X_load  = thin_in
+X_depth = depth_mat
+X_props = props_norm
+y_bulk  = bulk_tar
+
+# ─────────────────────────────────────────────────────────────────────
+# (3) Train/validation split
+# ─────────────────────────────────────────────────────────────────────
+(Xl_tr, Xl_va,
+ Xd_tr, Xd_va,
+ Xp_tr, Xp_va,
+ y_tr,  y_va,
+ d_tr,  d_va) = train_test_split(
+    X_load, X_depth, X_props, y_bulk, max_depths,
+    test_size=0.2, random_state=42
+)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+train_ds = TensorDataset(
+    torch.tensor(Xl_tr, dtype=torch.float32, device=device),
+    torch.tensor(Xd_tr, dtype=torch.float32, device=device),
+    torch.tensor(Xp_tr, dtype=torch.float32, device=device),
+    torch.tensor(y_tr,  dtype=torch.float32, device=device),
+)
+val_ds = TensorDataset(
+    torch.tensor(Xl_va, dtype=torch.float32, device=device),
+    torch.tensor(Xd_va, dtype=torch.float32, device=device),
+    torch.tensor(Xp_va, dtype=torch.float32, device=device),
+    torch.tensor(y_va,  dtype=torch.float32, device=device),
+)
+train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, pin_memory=True)
+val_loader   = DataLoader(val_ds,   batch_size=32, pin_memory=True)
+
+# ─────────────────────────────────────────────────────────────────────
+# (4) 1D-CNN definition
+# ─────────────────────────────────────────────────────────────────────
+class CNN1D(nn.Module):
+    def __init__(self, n_props, seq_len):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(2, 16, kernel_size=5, padding=2),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(16, 32, kernel_size=5, padding=2),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+        )
+        conv_len = seq_len // 4
+        self.fc = nn.Sequential(
+            nn.Linear(32*conv_len + n_props, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, seq_len),
+        )
+
+    def forward(self, load, depth, props):
+        x = torch.stack([load, depth], dim=1)  # (B,2,L)
+        x = self.conv(x)                       # (B,32,L/4)
+        x = x.flatten(1)
+        x = torch.cat([x, props], dim=1)
+        return self.fc(x)
+
+model = CNN1D(n_props=X_props.shape[1], seq_len=n_points).to(device)
+
+# ─────────────────────────────────────────────────────────────────────
+# (5) Training with early stopping
+# ─────────────────────────────────────────────────────────────────────
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+best_val, wait, patience = float('inf'), 0, 10
+train_losses, val_losses = [], []
+
+for epoch in range(1, 101):
+    model.train()
+    t_loss = 0
+    for load_b, depth_b, prop_b, y_b in train_loader:
+        optimizer.zero_grad()
+        out = model(load_b, depth_b, prop_b)
+        loss = criterion(out, y_b)
+        loss.backward()
+        optimizer.step()
+        t_loss += loss.item() * load_b.size(0)
+    t_loss /= len(train_loader.dataset)
+
+    model.eval()
+    v_loss = 0
+    with torch.no_grad():
+        for load_b, depth_b, prop_b, y_b in val_loader:
+            v_loss += criterion(model(load_b, depth_b, prop_b), y_b).item() * load_b.size(0)
+    v_loss /= len(val_loader.dataset)
+
+    train_losses.append(t_loss)
+    val_losses.append(v_loss)
+    print(f"Epoch {epoch}: Train={t_loss:.4f}, Val={v_loss:.4f}")
+
+    if v_loss < best_val:
+        best_val, wait = v_loss, 0
+        torch.save(model.state_dict(), '/content/drive/MyDrive/2024 UTk Research/2024 Fall Thin Film/Substrate Correction 2025/Different Thickness Film/1 um Thickness/thin_to_bulk_best_1umthick_test.pth')
+    else:
+        wait += 1
+        if wait >= patience:
+            print("Early stopping.")
+            break
+
+model.load_state_dict(torch.load('/content/drive/MyDrive/2024 UTk Research/2024 Fall Thin Film/Substrate Correction 2025/Different Thickness Film/1 um Thickness/thin_to_bulk_best_1umthick_test.pth'))
+
+# ─────────────────────────────────────────────────────────────────────
+# (6) Plot losses  [ORIGINAL]
+# ─────────────────────────────────────────────────────────────────────
+plt.figure(figsize=(6,4))
+epochs = np.arange(1, len(train_losses) + 1)
+plt.plot(epochs, train_losses, '-o', label='Train')
+plt.plot(epochs, val_losses,   '-o', label='Val')
+plt.xlabel('Epoch')
+plt.ylabel('MSE')
+plt.legend()
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT A — Enhanced Training Curve (Publication Quality)
+# ─────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+fig.suptitle('1D-CNN Training Diagnostics', fontsize=16, fontweight='bold', y=1.01)
+
+ax = axes[0]
+ax.plot(epochs, train_losses, '-o', color='#2196F3', markersize=4, linewidth=2, label='Train Loss')
+ax.plot(epochs, val_losses,   '-s', color='#F44336', markersize=4, linewidth=2, label='Validation Loss')
+ax.fill_between(epochs, train_losses, val_losses, alpha=0.08, color='purple')
+ax.set_xlabel('Epoch', fontsize=12)
+ax.set_ylabel('MSE Loss', fontsize=12)
+ax.set_title('Train vs. Validation Loss', fontsize=13)
+ax.legend(fontsize=11)
+ax.grid(True, linestyle='--', alpha=0.5)
+ax.set_xlim(left=1)
+
+ax2 = axes[1]
+ax2.semilogy(epochs, train_losses, '-o', color='#2196F3', markersize=4, linewidth=2, label='Train Loss')
+ax2.semilogy(epochs, val_losses,   '-s', color='#F44336', markersize=4, linewidth=2, label='Validation Loss')
+best_epoch = int(np.argmin(val_losses)) + 1
+ax2.axvline(best_epoch, color='green', linestyle=':', linewidth=2, label=f'Best Epoch ({best_epoch})')
+ax2.set_xlabel('Epoch', fontsize=12)
+ax2.set_ylabel('MSE Loss (log scale)', fontsize=12)
+ax2.set_title('Log-Scale Loss Curve', fontsize=13)
+ax2.legend(fontsize=11)
+ax2.grid(True, linestyle='--', alpha=0.5, which='both')
+ax2.set_xlim(left=1)
+
+plt.tight_layout()
+plt.savefig('training_diagnostics.png', dpi=300, bbox_inches='tight')
+plt.show()
+print(f"  Best epoch: {best_epoch}  |  Best Val MSE: {min(val_losses):.6f}")
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT B — Overfitting Gap Over Epochs
+# ─────────────────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(8, 4))
+gap = np.array(val_losses) - np.array(train_losses)
+ax.bar(epochs, gap, color=np.where(gap > 0, '#E53935', '#43A047'), alpha=0.75, edgecolor='none')
+ax.axhline(0, color='black', linewidth=1)
+ax.set_xlabel('Epoch', fontsize=12)
+ax.set_ylabel('Val Loss − Train Loss', fontsize=12)
+ax.set_title('Generalization Gap Per Epoch\n(positive = overfitting risk)', fontsize=13)
+ax.grid(True, axis='y', linestyle='--', alpha=0.4)
+legend_elements = [Patch(facecolor='#E53935', label='Overfitting'), Patch(facecolor='#43A047', label='Underfitting')]
+ax.legend(handles=legend_elements, fontsize=10)
+plt.tight_layout()
+plt.savefig('generalization_gap.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# (7) Validation predictions visualization  [ORIGINAL]
+# ─────────────────────────────────────────────────────────────────────
+model.eval()
+with torch.no_grad():
+    l_va = torch.tensor(Xl_va, dtype=torch.float32, device=device)
+    d_va = torch.tensor(Xd_va, dtype=torch.float32, device=device)
+    p_va = torch.tensor(Xp_va, dtype=torch.float32, device=device)
+    y_va_pred = model(l_va, d_va, p_va).cpu().numpy()
+
+for i in range(5):
+    dd = u_grid * d_va[i].cpu().numpy()
+    plt.figure(figsize=(5,4))
+    plt.plot(dd, y_va[i],    label='True Bulk')
+    plt.plot(dd, y_va_pred[i], '--', label='Pred Bulk')
+    plt.xlabel('Depth')
+    plt.ylabel('Load')
+    plt.title(f'Val #{i+1}')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT C — Validation Grid: Thin Input vs. Predicted vs. True Bulk
+# ─────────────────────────────────────────────────────────────────────
+n_grid = 9
+fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+fig.suptitle('Validation Set: Thin Film Input → Predicted Bulk vs. True Bulk\n(1D-CNN, 1 µm Thickness)', fontsize=15, fontweight='bold')
+colors = {'thin': '#78909C', 'pred': '#E53935', 'true': '#1565C0'}
+for idx, ax in enumerate(axes.flat):
+    if idx >= len(y_va): break
+    dd = u_grid * d_va[idx].cpu().numpy()
+    ax.plot(dd, Xl_va[idx],      color=colors['thin'], linewidth=1.5, linestyle='-',  label='Thin Input', alpha=0.7)
+    ax.plot(dd, y_va[idx],       color=colors['true'], linewidth=2,   linestyle='-',  label='True Bulk')
+    ax.plot(dd, y_va_pred[idx],  color=colors['pred'], linewidth=2,   linestyle='--', label='Predicted')
+    r2 = r2_score(y_va[idx], y_va_pred[idx])
+    mse = np.mean((y_va[idx] - y_va_pred[idx])**2)
+    ax.set_title(f'Val #{idx+1}  |  R²={r2:.4f}  |  MSE={mse:.4f}', fontsize=9)
+    ax.set_xlabel('Depth', fontsize=8); ax.set_ylabel('Load', fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.grid(True, alpha=0.3)
+handles = [plt.Line2D([0],[0], color=v, linewidth=2, linestyle='-' if k=='thin' or k=='true' else '--', label=k.title()) for k,v in colors.items()]
+fig.legend(handles=handles, loc='lower center', ncol=3, fontsize=11, bbox_to_anchor=(0.5, -0.02))
+plt.tight_layout(rect=[0,0.03,1,1])
+plt.savefig('validation_grid.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT D — Per-sample R² and MSE on full validation set
+# ─────────────────────────────────────────────────────────────────────
+r2_vals  = np.array([r2_score(y_va[i], y_va_pred[i]) for i in range(len(y_va))])
+mse_vals = np.array([np.mean((y_va[i] - y_va_pred[i])**2) for i in range(len(y_va))])
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+fig.suptitle('Per-Sample Model Performance on Validation Set', fontsize=14, fontweight='bold')
+
+ax = axes[0]
+ax.hist(r2_vals, bins=30, color='#1E88E5', edgecolor='white', alpha=0.85)
+ax.axvline(np.mean(r2_vals), color='red', linestyle='--', linewidth=2, label=f'Mean R²={np.mean(r2_vals):.4f}')
+ax.axvline(np.median(r2_vals), color='orange', linestyle=':', linewidth=2, label=f'Median={np.median(r2_vals):.4f}')
+ax.set_xlabel('R² Score', fontsize=12); ax.set_ylabel('Count', fontsize=12)
+ax.set_title('R² Distribution', fontsize=13)
+ax.legend(fontsize=10); ax.grid(True, alpha=0.3)
+
+ax = axes[1]
+ax.hist(mse_vals, bins=30, color='#43A047', edgecolor='white', alpha=0.85)
+ax.axvline(np.mean(mse_vals), color='red', linestyle='--', linewidth=2, label=f'Mean MSE={np.mean(mse_vals):.4f}')
+ax.axvline(np.median(mse_vals), color='orange', linestyle=':', linewidth=2, label=f'Median={np.median(mse_vals):.4f}')
+ax.set_xlabel('MSE', fontsize=12); ax.set_ylabel('Count', fontsize=12)
+ax.set_title('MSE Distribution', fontsize=13)
+ax.legend(fontsize=10); ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('validation_metrics_distribution.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT E — Predicted vs True Scatter (Parity Plot) on Validation
+# ─────────────────────────────────────────────────────────────────────
+all_true = y_va.flatten()
+all_pred = y_va_pred.flatten()
+subsample = np.random.choice(len(all_true), size=min(5000, len(all_true)), replace=False)
+fig, ax = plt.subplots(figsize=(7, 7))
+h = ax.hexbin(all_true[subsample], all_pred[subsample], gridsize=60, cmap='Blues', mincnt=1)
+lims = [min(all_true.min(), all_pred.min()), max(all_true.max(), all_pred.max())]
+ax.plot(lims, lims, 'r--', linewidth=2, label='Perfect prediction')
+ax.set_xlabel('True Bulk Load', fontsize=13)
+ax.set_ylabel('Predicted Bulk Load', fontsize=13)
+ax.set_title('Parity Plot — Predicted vs. True (Validation)\nHexbin density', fontsize=13)
+plt.colorbar(h, ax=ax, label='Point density')
+r2_all = r2_score(all_true, all_pred)
+ax.text(0.05, 0.92, f'R² = {r2_all:.5f}', transform=ax.transAxes, fontsize=12,
+        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+ax.legend(fontsize=10); ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('parity_plot_validation.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT F — Residual Distribution on Validation
+# ─────────────────────────────────────────────────────────────────────
+residuals = (y_va_pred - y_va).flatten()
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+fig.suptitle('Residual Analysis — Validation Set', fontsize=14, fontweight='bold')
+
+ax = axes[0]
+ax.hist(residuals, bins=60, color='#7B1FA2', edgecolor='white', alpha=0.85, density=True)
+from scipy.stats import norm as scipy_norm
+mu, std = residuals.mean(), residuals.std()
+x_range = np.linspace(residuals.min(), residuals.max(), 300)
+ax.plot(x_range, scipy_norm.pdf(x_range, mu, std), 'r-', linewidth=2, label=f'Normal fit\nμ={mu:.4f}, σ={std:.4f}')
+ax.axvline(0, color='black', linewidth=1.5, linestyle='--')
+ax.set_xlabel('Residual (Predicted − True)', fontsize=12); ax.set_ylabel('Density', fontsize=12)
+ax.set_title('Residual Histogram', fontsize=13)
+ax.legend(fontsize=10); ax.grid(True, alpha=0.3)
+
+ax = axes[1]
+ax.scatter(all_true[subsample], (y_va_pred - y_va).flatten()[subsample],
+           alpha=0.2, s=5, color='#7B1FA2')
+ax.axhline(0, color='red', linewidth=2, linestyle='--')
+ax.axhline(+2*std, color='orange', linewidth=1, linestyle=':', label=f'±2σ = ±{2*std:.4f}')
+ax.axhline(-2*std, color='orange', linewidth=1, linestyle=':')
+ax.set_xlabel('True Bulk Load', fontsize=12); ax.set_ylabel('Residual', fontsize=12)
+ax.set_title('Residuals vs. True Values', fontsize=13)
+ax.legend(fontsize=10); ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('residual_analysis.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT G — Mean Curve Envelopes on Validation Set
+# ─────────────────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(9, 5))
+mean_true = y_va.mean(0)
+std_true  = y_va.std(0)
+mean_pred = y_va_pred.mean(0)
+std_pred  = y_va_pred.std(0)
+dd_mean   = u_grid * d_va[0].cpu().numpy()
+
+ax.fill_between(dd_mean, mean_true - std_true, mean_true + std_true, alpha=0.2, color='#1565C0', label='True ±1σ')
+ax.fill_between(dd_mean, mean_pred - std_pred, mean_pred + std_pred, alpha=0.2, color='#E53935', label='Predicted ±1σ')
+ax.plot(dd_mean, mean_true, color='#1565C0', linewidth=2.5, label='Mean True Bulk')
+ax.plot(dd_mean, mean_pred, color='#E53935', linewidth=2.5, linestyle='--', label='Mean Predicted Bulk')
+ax.set_xlabel('Depth', fontsize=13); ax.set_ylabel('Load', fontsize=13)
+ax.set_title('Mean ± 1σ Envelopes — Validation Set\n1D-CNN Bulk Curve Prediction', fontsize=13)
+ax.legend(fontsize=11); ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('mean_envelope_validation.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT H — Pointwise MSE Profile Across Depth
+# ─────────────────────────────────────────────────────────────────────
+pointwise_mse = np.mean((y_va - y_va_pred)**2, axis=0)
+pointwise_mae = np.mean(np.abs(y_va - y_va_pred), axis=0)
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+fig.suptitle('Pointwise Error Profile Across Depth — Validation Set', fontsize=14, fontweight='bold')
+
+ax = axes[0]
+ax.fill_between(dd_mean, 0, pointwise_mse, alpha=0.6, color='#E53935')
+ax.plot(dd_mean, pointwise_mse, color='#B71C1C', linewidth=2)
+ax.set_xlabel('Depth', fontsize=12); ax.set_ylabel('MSE', fontsize=12)
+ax.set_title('Pointwise MSE vs. Depth', fontsize=13); ax.grid(True, alpha=0.3)
+
+ax = axes[1]
+ax.fill_between(dd_mean, 0, pointwise_mae, alpha=0.6, color='#1E88E5')
+ax.plot(dd_mean, pointwise_mae, color='#0D47A1', linewidth=2)
+ax.set_xlabel('Depth', fontsize=12); ax.set_ylabel('MAE', fontsize=12)
+ax.set_title('Pointwise MAE vs. Depth', fontsize=13); ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('pointwise_error_profile.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT I — Heatmap of Absolute Error (Validation Samples × Depth)
+# ─────────────────────────────────────────────────────────────────────
+abs_err = np.abs(y_va - y_va_pred)
+fig, ax = plt.subplots(figsize=(12, 6))
+im = ax.imshow(abs_err[:50], aspect='auto', cmap='hot', origin='upper',
+               extent=[dd_mean[0], dd_mean[-1], 50, 0])
+plt.colorbar(im, ax=ax, label='|Predicted − True|')
+ax.set_xlabel('Depth', fontsize=13); ax.set_ylabel('Sample Index', fontsize=13)
+ax.set_title('Absolute Error Heatmap — First 50 Validation Samples', fontsize=14)
+plt.tight_layout()
+plt.savefig('error_heatmap.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT J — Material Properties Distribution (Training Data)
+# ─────────────────────────────────────────────────────────────────────
+prop_labels = ['E (Elastic Modulus)', 'σ_y (Yield Strength)', 'σ_s (Ultimate Strength)']
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+fig.suptitle('Material Properties Distribution (Training Dataset)', fontsize=14, fontweight='bold')
+colors_p = ['#FF7043', '#66BB6A', '#42A5F5']
+for k, (ax, label, color) in enumerate(zip(axes, prop_labels, colors_p)):
+    vals = props[:, k]
+    ax.hist(vals, bins=40, color=color, edgecolor='white', alpha=0.85)
+    ax.axvline(vals.mean(), color='black', linestyle='--', linewidth=2, label=f'Mean={vals.mean():.2f}')
+    ax.set_xlabel(label, fontsize=10); ax.set_ylabel('Count', fontsize=10)
+    ax.set_title(label, fontsize=11); ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('properties_distribution.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# (8) Test set predict + plot vs true  [ORIGINAL]
+# ─────────────────────────────────────────────────────────────────────
+df_test = pd.read_excel(test_thin_file, header=None)
+n_test  = df_test.shape[1] // 2
+thin_t  = np.zeros((n_test, n_points), dtype=np.float32)
+tds     = np.zeros(n_test, dtype=np.float32)
+
+for i in range(n_test):
+    d = pd.to_numeric(df_test.iloc[:, 2*i],   errors='coerce').to_numpy()
+    l = pd.to_numeric(df_test.iloc[:, 2*i+1], errors='coerce').to_numpy()
+    td = np.nanmax(d) if not np.all(np.isnan(d)) else 1.0
+    tds[i] = td
+    norm_d = d / td if td != 0 else d
+    mask_tt = (~np.isnan(norm_d)) & (~np.isnan(l))
+    if mask_tt.sum() >= 2:
+        Xt = np.vstack([norm_d[mask_tt]**2, norm_d[mask_tt]]).T
+        yt = l[mask_tt]
+        coeffs_tt, *_ = np.linalg.lstsq(Xt, yt, rcond=None)
+        a_tt, b_tt = coeffs_tt
+        thin_t[i] = (a_tt * u_grid**2 + b_tt * u_grid).astype(np.float32)
+    else:
+        thin_t[i] = np.interp(u_grid, norm_d, l).astype(np.float32)
+
+depth_test_mat = np.tile(depth_channel, (n_test, 1)).astype(np.float32)
+props_test_norm = props_norm[:n_test]
+
+mask_t = np.isnan(thin_t).any(1)
+thin_t, depth_test_mat, props_test_norm, tds = (
+    thin_t[~mask_t],
+    depth_test_mat[~mask_t],
+    props_test_norm[~mask_t],
+    tds[~mask_t]
+)
+
+model.eval()
+with torch.no_grad():
+    pred_test = model(
+        torch.tensor(thin_t,        dtype=torch.float32),
+        torch.tensor(depth_test_mat,dtype=torch.float32),
+        torch.tensor(props_test_norm, dtype=torch.float32)
+    ).cpu().numpy()
+
+pd.DataFrame(pred_test).to_excel(pred_output, index=False, engine='openpyxl')
+
+df_true = pd.read_csv(true_file, header=None)
+n_true = df_true.shape[1] // 2
+n_plot = min(n_true, thin_t.shape[0], pred_test.shape[0])
+
+for i in range(n_plot):
+    depth_true = pd.to_numeric(df_true.iloc[:, 2*i],   errors='coerce').to_numpy()
+    load_true  = pd.to_numeric(df_true.iloc[:, 2*i+1], errors='coerce').to_numpy()
+    dd = u_grid * tds[i]
+    plt.figure(figsize=(6,4))
+    plt.plot(dd,            thin_t[i],    '-',  label='Thin Input')
+    plt.plot(dd,            pred_test[i], '--', label='Pred Bulk')
+    plt.plot(depth_true,    load_true,    ':',  label='True Bulk')
+    plt.title(f'Sample #{i+1}')
+    plt.xlabel('Depth')
+    plt.ylabel('Load')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT K — Test Set Grid (3×3): Thin / Predicted / True
+# ─────────────────────────────────────────────────────────────────────
+true_curves_all  = []
+true_depths_all  = []
+for i in range(n_plot):
+    depth_true = pd.to_numeric(df_true.iloc[:, 2*i],   errors='coerce').to_numpy()
+    load_true  = pd.to_numeric(df_true.iloc[:, 2*i+1], errors='coerce').to_numpy()
+    true_curves_all.append(load_true)
+    true_depths_all.append(depth_true)
+
+n_grid_test = min(9, n_plot)
+fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+fig.suptitle('Test Set: Thin Film → Predicted Bulk vs. True Bulk\n(1D-CNN Substrate Correction, 1 µm)', fontsize=15, fontweight='bold')
+for idx, ax in enumerate(axes.flat):
+    if idx >= n_grid_test: ax.axis('off'); continue
+    dd = u_grid * tds[idx]
+    ax.plot(dd, thin_t[idx],         color='#78909C', linewidth=1.5, linestyle='-',  label='Thin Input', alpha=0.7)
+    ax.plot(true_depths_all[idx], true_curves_all[idx], color='#1565C0', linewidth=2, linestyle='-',  label='True Bulk')
+    ax.plot(dd, pred_test[idx],       color='#E53935', linewidth=2,   linestyle='--', label='Predicted')
+    ax.set_title(f'Test #{idx+1}', fontsize=9)
+    ax.set_xlabel('Depth', fontsize=8); ax.set_ylabel('Load', fontsize=8)
+    ax.tick_params(labelsize=7); ax.grid(True, alpha=0.3)
+handles = [
+    plt.Line2D([0],[0], color='#78909C', linewidth=2, label='Thin Input'),
+    plt.Line2D([0],[0], color='#1565C0', linewidth=2, label='True Bulk'),
+    plt.Line2D([0],[0], color='#E53935', linewidth=2, linestyle='--', label='Predicted Bulk'),
+]
+fig.legend(handles=handles, loc='lower center', ncol=3, fontsize=11, bbox_to_anchor=(0.5, -0.02))
+plt.tight_layout(rect=[0,0.03,1,1])
+plt.savefig('test_grid.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT L — Test Set Parity Plot (Predicted vs True)
+# ─────────────────────────────────────────────────────────────────────
+# Align test predictions with true curves by interpolating true to u_grid
+true_on_grid = []
+for i in range(n_plot):
+    d_t = true_depths_all[i]
+    l_t = true_curves_all[i]
+    dd  = u_grid * tds[i]
+    valid = (~np.isnan(d_t)) & (~np.isnan(l_t))
+    if valid.sum() >= 2:
+        interp_l = np.interp(dd, d_t[valid], l_t[valid])
+    else:
+        interp_l = np.zeros(n_points)
+    true_on_grid.append(interp_l)
+true_on_grid = np.array(true_on_grid, dtype=np.float32)
+
+all_true_test = true_on_grid.flatten()
+all_pred_test = pred_test[:n_plot].flatten()
+subsample_test = np.random.choice(len(all_true_test), size=min(5000, len(all_true_test)), replace=False)
+
+fig, ax = plt.subplots(figsize=(7, 7))
+h = ax.hexbin(all_true_test[subsample_test], all_pred_test[subsample_test], gridsize=60, cmap='YlOrRd', mincnt=1)
+lims = [min(all_true_test.min(), all_pred_test.min()), max(all_true_test.max(), all_pred_test.max())]
+ax.plot(lims, lims, 'b--', linewidth=2, label='Perfect prediction')
+ax.set_xlabel('True Bulk Load', fontsize=13)
+ax.set_ylabel('Predicted Bulk Load', fontsize=13)
+ax.set_title('Test Set Parity Plot\n1D-CNN Substrate Correction (1 µm)', fontsize=13)
+plt.colorbar(h, ax=ax, label='Point density')
+r2_test = r2_score(all_true_test, all_pred_test)
+ax.text(0.05, 0.92, f'R² = {r2_test:.5f}', transform=ax.transAxes, fontsize=12,
+        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+ax.legend(fontsize=10); ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('parity_plot_test.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT M — Max Depth Distribution of Test Samples
+# ─────────────────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.hist(tds, bins=30, color='#26A69A', edgecolor='white', alpha=0.85)
+ax.axvline(tds.mean(), color='red', linestyle='--', linewidth=2, label=f'Mean={tds.mean():.2f} nm')
+ax.set_xlabel('Max Indentation Depth (nm)', fontsize=12)
+ax.set_ylabel('Count', fontsize=12)
+ax.set_title('Distribution of Max Indentation Depths — Test Set', fontsize=13)
+ax.legend(fontsize=10); ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('max_depth_distribution.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT N — Test Set Residual / Error Heatmap
+# ─────────────────────────────────────────────────────────────────────
+abs_err_test = np.abs(true_on_grid - pred_test[:n_plot])
+fig, ax = plt.subplots(figsize=(12, 6))
+im = ax.imshow(abs_err_test[:min(50, n_plot)], aspect='auto', cmap='plasma', origin='upper',
+               extent=[dd_mean[0], dd_mean[-1], min(50, n_plot), 0])
+plt.colorbar(im, ax=ax, label='|Predicted − True|')
+ax.set_xlabel('Depth', fontsize=13); ax.set_ylabel('Sample Index', fontsize=13)
+ax.set_title('Absolute Error Heatmap — Test Set (First 50 Samples)', fontsize=14)
+plt.tight_layout()
+plt.savefig('error_heatmap_test.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT O — Test vs Validation R² Comparison Bar Chart
+# ─────────────────────────────────────────────────────────────────────
+r2_test_per = np.array([r2_score(true_on_grid[i], pred_test[i]) for i in range(n_plot)])
+r2_va_per   = r2_vals[:n_plot]
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+fig.suptitle('R² Score Comparison: Validation vs. Test Set', fontsize=14, fontweight='bold')
+
+ax = axes[0]
+ax.hist(r2_va_per,   bins=25, alpha=0.7, color='#1E88E5', edgecolor='white', label='Validation')
+ax.hist(r2_test_per, bins=25, alpha=0.7, color='#F4511E', edgecolor='white', label='Test')
+ax.axvline(r2_va_per.mean(),   color='#1565C0', linestyle='--', linewidth=2, label=f'Val mean={r2_va_per.mean():.3f}')
+ax.axvline(r2_test_per.mean(), color='#BF360C', linestyle='--', linewidth=2, label=f'Test mean={r2_test_per.mean():.3f}')
+ax.set_xlabel('R²', fontsize=12); ax.set_ylabel('Count', fontsize=12)
+ax.set_title('R² Distribution Comparison', fontsize=13)
+ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+
+ax = axes[1]
+summary = {'Val R²': r2_va_per.mean(), 'Test R²': r2_test_per.mean(),
+           'Val MSE': mse_vals.mean(), 'Test MSE': np.mean((true_on_grid - pred_test[:n_plot])**2)}
+bar_colors = ['#1E88E5', '#F4511E', '#43A047', '#FF7043']
+bars = ax.bar(list(summary.keys()), list(summary.values()), color=bar_colors, edgecolor='white', alpha=0.85)
+for bar, val in zip(bars, summary.values()):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001, f'{val:.4f}',
+            ha='center', va='bottom', fontsize=10)
+ax.set_ylabel('Score', fontsize=12)
+ax.set_title('Summary Metrics: Val vs. Test', fontsize=13)
+ax.grid(True, axis='y', alpha=0.3)
+plt.tight_layout()
+plt.savefig('val_vs_test_comparison.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────
+# [ADDED] PLOT P — Final Summary Panel (Publication Figure)
+# ─────────────────────────────────────────────────────────────────────
+fig = plt.figure(figsize=(18, 14))
+gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.35)
+fig.suptitle('1D-CNN Substrate Correction Model — Summary Results\nThin Film (1 µm) → Bulk Equivalent Curve Prediction',
+             fontsize=16, fontweight='bold', y=1.01)
+
+# Panel 1: Loss curves
+ax1 = fig.add_subplot(gs[0, 0])
+ax1.plot(epochs, train_losses, '-', color='#2196F3', linewidth=2, label='Train')
+ax1.plot(epochs, val_losses,   '-', color='#F44336', linewidth=2, label='Val')
+ax1.axvline(best_epoch, color='green', linestyle=':', linewidth=1.5)
+ax1.set_xlabel('Epoch'); ax1.set_ylabel('MSE'); ax1.set_title('(a) Training Loss')
+ax1.legend(fontsize=8); ax1.grid(True, alpha=0.3)
+
+# Panel 2: Val R² histogram
+ax2 = fig.add_subplot(gs[0, 1])
+ax2.hist(r2_vals, bins=25, color='#1E88E5', edgecolor='white', alpha=0.85)
+ax2.axvline(r2_vals.mean(), color='red', linestyle='--', linewidth=2, label=f'μ={r2_vals.mean():.3f}')
+ax2.set_xlabel('R²'); ax2.set_ylabel('Count'); ax2.set_title('(b) Validation R² Distribution')
+ax2.legend(fontsize=8); ax2.grid(True, alpha=0.3)
+
+# Panel 3: Test R² histogram
+ax3 = fig.add_subplot(gs[0, 2])
+ax3.hist(r2_test_per, bins=25, color='#F4511E', edgecolor='white', alpha=0.85)
+ax3.axvline(r2_test_per.mean(), color='darkred', linestyle='--', linewidth=2, label=f'μ={r2_test_per.mean():.3f}')
+ax3.set_xlabel('R²'); ax3.set_ylabel('Count'); ax3.set_title('(c) Test R² Distribution')
+ax3.legend(fontsize=8); ax3.grid(True, alpha=0.3)
+
+# Panel 4: Mean envelope
+ax4 = fig.add_subplot(gs[1, :2])
+ax4.fill_between(dd_mean, mean_true-std_true, mean_true+std_true, alpha=0.2, color='#1565C0')
+ax4.fill_between(dd_mean, mean_pred-std_pred, mean_pred+std_pred, alpha=0.2, color='#E53935')
+ax4.plot(dd_mean, mean_true, color='#1565C0', linewidth=2.5, label='Mean True')
+ax4.plot(dd_mean, mean_pred, color='#E53935', linewidth=2.5, linestyle='--', label='Mean Predicted')
+ax4.set_xlabel('Depth'); ax4.set_ylabel('Load'); ax4.set_title('(d) Mean ±1σ Envelope (Validation)')
+ax4.legend(fontsize=9); ax4.grid(True, alpha=0.3)
+
+# Panel 5: Pointwise MSE
+ax5 = fig.add_subplot(gs[1, 2])
+ax5.fill_between(dd_mean, 0, pointwise_mse, alpha=0.6, color='#E53935')
+ax5.plot(dd_mean, pointwise_mse, color='#B71C1C', linewidth=2)
+ax5.set_xlabel('Depth'); ax5.set_ylabel('MSE'); ax5.set_title('(e) Pointwise MSE (Validation)')
+ax5.grid(True, alpha=0.3)
+
+# Panel 6: Parity plot (val)
+ax6 = fig.add_subplot(gs[2, 0])
+ax6.hexbin(all_true[subsample], all_pred[subsample], gridsize=40, cmap='Blues', mincnt=1)
+lims2 = [all_true.min(), all_true.max()]
+ax6.plot(lims2, lims2, 'r--', linewidth=1.5)
+ax6.set_xlabel('True Load'); ax6.set_ylabel('Predicted Load')
+ax6.set_title(f'(f) Parity — Val (R²={r2_all:.4f})')
+ax6.grid(True, alpha=0.3)
+
+# Panel 7: Parity plot (test)
+ax7 = fig.add_subplot(gs[2, 1])
+ax7.hexbin(all_true_test[subsample_test], all_pred_test[subsample_test], gridsize=40, cmap='YlOrRd', mincnt=1)
+lims3 = [all_true_test.min(), all_true_test.max()]
+ax7.plot(lims3, lims3, 'b--', linewidth=1.5)
+ax7.set_xlabel('True Load'); ax7.set_ylabel('Predicted Load')
+ax7.set_title(f'(g) Parity — Test (R²={r2_test:.4f})')
+ax7.grid(True, alpha=0.3)
+
+# Panel 8: Summary bar
+ax8 = fig.add_subplot(gs[2, 2])
+metrics_summary = {
+    'Val R²':   r2_va_per.mean(),
+    'Test R²':  r2_test_per.mean(),
+    'Val MSE':  mse_vals.mean(),
+    'Test MSE': np.mean((true_on_grid - pred_test[:n_plot])**2),
+}
+bc = ['#1E88E5','#F4511E','#43A047','#FF7043']
+b2 = ax8.bar(list(metrics_summary.keys()), list(metrics_summary.values()), color=bc, edgecolor='white', alpha=0.85)
+for bar, val in zip(b2, metrics_summary.values()):
+    ax8.text(bar.get_x()+bar.get_width()/2, bar.get_height()*1.02, f'{val:.3f}',
+             ha='center', fontsize=9)
+ax8.set_ylabel('Score'); ax8.set_title('(h) Summary Metrics')
+ax8.grid(True, axis='y', alpha=0.3)
+
+plt.savefig('summary_panel.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+print("\n✅ All plots complete.")
+print("Saved: training_diagnostics.png, generalization_gap.png, validation_grid.png,")
+print("       validation_metrics_distribution.png, parity_plot_validation.png,")
+print("       residual_analysis.png, mean_envelope_validation.png,")
+print("       pointwise_error_profile.png, error_heatmap.png,")
+print("       properties_distribution.png, test_grid.png, parity_plot_test.png,")
+print("       max_depth_distribution.png, error_heatmap_test.png,")
+print("       val_vs_test_comparison.png, summary_panel.png")
