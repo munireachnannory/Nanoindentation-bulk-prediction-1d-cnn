@@ -1,0 +1,97 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ─────────────────────────────────────────────────────────────────────
+# Paths to your actual and predicted multi-sheet Excel files
+# ─────────────────────────────────────────────────────────────────────
+actual_file    = '/content/drive/MyDrive/2024 UTk Research/2024 Fall Thin Film/Substrate Correction 2025/Copper Experiment Thickness of 4um Test 2 Sample 5.xlsx'
+predicted_file = '/content/drive/MyDrive/2024 UTk Research/2024 Fall Thin Film/Substrate Correction 2025/Different Thickness Film/3 um Thickness/11_analyzed.xlsx'
+
+# ─────────────────────────────────────────────────────────────────────
+# Read all sheets
+# ─────────────────────────────────────────────────────────────────────
+actual_sheets    = pd.read_excel(actual_file, sheet_name=None)
+predicted_sheets = pd.read_excel(predicted_file, sheet_name=None)
+
+# ─────────────────────────────────────────────────────────────────────
+# Collect actual curves
+# ─────────────────────────────────────────────────────────────────────
+actual_depths = []
+actual_loads  = []
+for name, df in actual_sheets.items():
+    depth = pd.to_numeric(df.iloc[:,0], errors='coerce').to_numpy()
+    load_ = pd.to_numeric(df.iloc[:,1], errors='coerce').to_numpy()
+    mask = (~np.isnan(depth)) & (~np.isnan(load_))
+    if mask.sum() > 0:
+        actual_depths.append(depth[mask])
+        actual_loads.append(load_[mask])
+
+# ─────────────────────────────────────────────────────────────────────
+# Collect predicted curves
+# ─────────────────────────────────────────────────────────────────────
+pred_depths = []
+pred_loads  = []
+for name, df in predicted_sheets.items():
+    # Assuming depth is in column 0 and load is in column 1 based on the previous cell output
+    depth = df.iloc[:, 0].to_numpy()
+    load_ = df.iloc[:, 1].to_numpy()
+    if depth.size > 0 and load_.size > 0:
+        pred_depths.append(depth)
+        pred_loads.append(load_)
+
+# ─────────────────────────────────────────────────────────────────────
+# Define common depth grid over full range
+# ─────────────────────────────────────────────────────────────────────
+# Check if actual_depths and pred_depths are not empty before finding max
+if actual_depths and pred_depths:
+    max_actual = max(d.max() for d in actual_depths if d.size > 0)
+    max_pred   = max(d.max() for d in pred_depths if d.size > 0)
+    common_max = max(max_actual, max_pred)
+    n_points   = 200
+    common_depth = np.linspace(0, common_max, n_points)
+else:
+    print("No valid actual or predicted data to plot.")
+    # Handle the case where there is no data, maybe exit or return
+    # For now, we'll skip plotting and just print the message
+    common_depth = np.array([]) # or some other appropriate handling
+    avg_actual = np.array([])
+    avg_pred = np.array([])
+    # Skip plotting
+    # exit() # or return
+
+    # Add a dummy plot or message indicating no data
+    plt.figure(figsize=(6,4))
+    plt.text(0.5, 0.5, "No valid actual or predicted data to plot.", horizontalalignment='center', verticalalignment='center', transform=plt.gca().transAxes)
+    plt.show()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Interpolate all curves onto common grid
+# ─────────────────────────────────────────────────────────────────────
+if common_depth.size > 0 and actual_depths and pred_depths:
+    actual_matrix = np.vstack([
+        np.interp(common_depth, d, l) for d, l in zip(actual_depths, actual_loads)
+    ])
+    pred_matrix = np.vstack([
+        np.interp(common_depth, d, l) for d, l in zip(pred_depths, pred_loads)
+    ])
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Compute average curves
+    # ─────────────────────────────────────────────────────────────────────
+    avg_actual = actual_matrix.mean(axis=0)
+    avg_pred   = pred_matrix.mean(axis=0)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Plot average actual vs average predicted
+    # ─────────────────────────────────────────────────────────────────────
+    plt.figure(figsize=(6,4))
+    plt.plot(common_depth, avg_actual, 'k-', linewidth=2, label='Average Actual')
+    plt.plot(common_depth, avg_pred,   'r--', linewidth=2, label='Average Predicted')
+    plt.xlabel('Depth (units)')
+    plt.ylabel('Load')
+    plt.title('Average Actual vs. Average Predicted Bulk Curves')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
